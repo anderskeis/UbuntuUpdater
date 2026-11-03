@@ -27,8 +27,8 @@ Universal Ubuntu host updater — preview (dry-run) is the default.
 Usage: upgrade-host.sh [--dry-run] [--apply] [--skip-<section>...]
 
 Sections (auto-detected; skipped when not installed on this host):
-  apt      APT packages       -> apt-get update + upgrade (uses sudo)
-  snap     snaps               -> snap refresh
+  apt      APT packages       -> apt-get update + upgrade (sudo per command)
+  snap     snaps               -> sudo snap refresh
   flatpak  flatpak apps        -> flatpak update
   fwupd    device firmware     -> fwupdmgr update
   pipx     pipx apps           -> pipx upgrade-all
@@ -109,12 +109,14 @@ apply_apt() {
 }
 
 preview_snap() {
-  if ! phase snap-preview snap refresh --list; then
-    log 'snap refresh --list unsupported; falling back to snap list' || return 74
+  if snap refresh --help 2>&1 | grep -q -- '--list'; then
+    phase snap-preview snap refresh --list || return $?
+  else
+    log 'snap refresh --list not supported here; falling back to snap list' || return 74
     phase snap-list snap list || return $?
   fi
 }
-apply_snap() { phase snap-refresh snap refresh; }
+apply_snap() { phase snap-refresh sudo snap refresh; }
 
 preview_flatpak() {
   if flatpak remote-ls --help 2>&1 | grep -q -- '--updates'; then
@@ -275,6 +277,12 @@ main() {
   if $APPLY; then mode=apply; fi
   log "mode=$mode log=$LOG_FILE" || fail 'cannot write initial log'
 
+  # Cancellation must stop the whole run, not be recorded as one section's
+  # failure while later updaters keep mutating packages.
+  trap 'log "received SIGINT; stopping the run" || true; exit 130' INT
+  trap 'log "received SIGTERM; stopping the run" || true; exit 143' TERM
+  trap 'log "received SIGHUP; stopping the run" || true; exit 129' HUP
+
   for id in "${SECTIONS[@]}"; do
     if section_skipped "$id"; then
       log "section $id skipped (--skip-$id)" || fail 'cannot write skip log'
@@ -299,6 +307,7 @@ main() {
     for id in "${active[@]}"; do
       case $id in
         apt) need_sudo=true ;;
+        snap) need_sudo=true ;;
         flatpak) if flatpak_system; then need_sudo=true; fi ;;
       esac
     done

@@ -8,7 +8,7 @@ sudo — `sudo` is used per command where needed).
 | Section | Native update command | Runs when |
 | --- | --- | --- |
 | apt | `apt-get update` + `apt-get --no-remove upgrade` | always on Ubuntu |
-| snap | `snap refresh` | `snap` installed |
+| snap | `sudo snap refresh` | `snap` installed |
 | flatpak | `flatpak update -y` (user install, plus system install via sudo) | `flatpak` installed |
 | fwupd | `fwupdmgr refresh` + `fwupdmgr update --no-reboot-check` | `fwupdmgr` installed |
 | pipx | `pipx upgrade-all` | `pipx` installed |
@@ -33,6 +33,8 @@ sudo — `sudo` is used per command where needed).
   packages (see `filter-global-npm.js`, which must sit next to the script).
 - A failing section does not stop the others; the exit code is 0 only if all
   active sections succeeded.
+- Ctrl-C / SIGTERM / SIGHUP stops the whole run immediately — no later section
+  is started after cancellation.
 - `/var/run/reboot-required` is reported at the end but a reboot is never
   performed. Note fwupd can stage firmware that needs a reboot without that
   marker existing.

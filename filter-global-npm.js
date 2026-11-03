@@ -22,7 +22,8 @@ function fail(code, msg) {
 // A name is safe to forward to `npm update` only if it is relative and every
 // path segment is a real segment — no '', '.', '..' traversal, no absolutes.
 function isSafePackageName(name) {
-  if (typeof name !== 'string' || name.length === 0 || name.includes('\0')) return false;
+  if (typeof name !== 'string' || name.length === 0) return false;
+  if (/[\x00-\x1f\x7f]/.test(name)) return false; // control chars, incl. newlines
   if (path.isAbsolute(name)) return false;
   return name.split('/').every((seg) => seg !== '' && seg !== '.' && seg !== '..');
 }
