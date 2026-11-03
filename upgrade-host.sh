@@ -125,17 +125,29 @@ preview_flatpak() {
   fi
 }
 apply_flatpak() {
+  local rc=0
+  phase flatpak-update-user flatpak update -y || rc=$?
   if flatpak_system; then
-    phase flatpak-update sudo flatpak update -y || return $?
-  else
-    phase flatpak-update flatpak update -y || return $?
+    phase flatpak-update-system sudo flatpak update -y || rc=$?
   fi
+  return "$rc"
 }
 
-preview_fwupd() { phase fwupd-preview fwupdmgr get-updates; }
+# fwupdmgr uses exit status 2 for "nothing to do"; treat it as success.
+fwupd_run() {
+  local name=$1 rc=0
+  shift
+  phase "$name" "$@" || rc=$?
+  if ((rc == 2)); then
+    log "command=$name exit=2 (nothing to do); treated as success" || true
+    return 0
+  fi
+  return "$rc"
+}
+preview_fwupd() { fwupd_run fwupd-preview fwupdmgr get-updates; }
 apply_fwupd() {
-  phase fwupd-refresh fwupdmgr refresh || return $?
-  phase fwupd-update fwupdmgr update || return $?
+  fwupd_run fwupd-refresh fwupdmgr refresh || return $?
+  fwupd_run fwupd-update fwupdmgr update --no-reboot-check || return $?
 }
 
 preview_pipx() {
@@ -166,8 +178,9 @@ npm_discover() {
     return 66
   }
   inventory_json=$("$npm_bin" ls --global --depth=0 --json) || return $?
-  if ! pkgs=$(printf '%s' "$inventory_json" | "$node_bin" "$helper" "$root"); then
-    rc=$?
+  rc=0
+  pkgs=$(printf '%s' "$inventory_json" | "$node_bin" "$helper" "$root") || rc=$?
+  if ((rc != 0)); then
     printf 'ERROR: invalid npm global inventory (status %s)\n' "$rc" >&2
     return "$rc"
   fi

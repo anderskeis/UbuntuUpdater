@@ -5,8 +5,9 @@
 // Reads `npm ls --global --depth=0 --json` from stdin and prints the names of
 // globally installed packages that are safe to update with `npm update -g`,
 // one per line. Excludes the runtime/package manager itself and OpenClaw
-// (which manages its own updates), and only keeps packages that really exist
-// as real directories under the given global root.
+// (which manages its own updates), and only keeps packages whose canonical
+// (fully resolved) path is exactly under the canonical global root, so
+// symlinked scope/package directories cannot escape the root.
 const fs = require('fs');
 const path = require('path');
 
@@ -22,6 +23,12 @@ function main() {
   const root = process.argv[2];
   if (!root || !path.isAbsolute(root)) {
     fail(64, 'usage: filter-global-npm.js <absolute npm global root>');
+  }
+  let realRoot;
+  try {
+    realRoot = fs.realpathSync(root);
+  } catch (err) {
+    fail(65, 'cannot resolve npm global root ' + root + ': ' + err.message);
   }
   let raw;
   try {
@@ -48,15 +55,15 @@ function main() {
       continue;
     }
     const dir = path.join(root, name);
-    let st;
+    let real;
     try {
-      st = fs.lstatSync(dir);
+      real = fs.realpathSync(dir);
     } catch {
       console.error('filter-global-npm: skipping missing package dir: ' + dir);
       continue;
     }
-    if (st.isSymbolicLink() || !st.isDirectory()) {
-      console.error('filter-global-npm: skipping unsafe package dir: ' + dir);
+    if (real !== path.join(realRoot, name)) {
+      console.error('filter-global-npm: skipping package resolving outside global root: ' + dir + ' -> ' + real);
       continue;
     }
     eligible.push(name);
