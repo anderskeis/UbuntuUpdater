@@ -20,6 +20,7 @@ SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 SECTIONS=(apt snap flatpak fwupd pipx brew npm)
 SKIP_APT=false SKIP_SNAP=false SKIP_FLATPAK=false SKIP_FWUPD=false SKIP_PIPX=false SKIP_BREW=false SKIP_NPM=false
 NPM_ARGS=()
+CHILD_PID=
 
 usage() {
   cat <<'USAGE'
@@ -61,13 +62,40 @@ log() {
   fi
 }
 
+# Cancellation handler: forward the signal to the active command, wait for it
+# to stop, then exit — so no later section starts and the lock (fd 9) is only
+# released after the active updater has shut down.
+on_signal() {
+  local sig=$1 code=$2 pid=$CHILD_PID i
+  log "received SIG$sig; forwarding to active command and stopping the run" || true
+  if [[ -n $pid ]]; then
+    kill -"$sig" "$pid" 2>/dev/null || true
+    # Async children ignore SIGINT/SIGQUIT, so escalate if the command does
+    # not stop promptly; always reap it before exiting so the lock (fd 9) is
+    # released only after the active updater has stopped.
+    for ((i = 0; i < 20; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -TERM "$pid" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+
+# Run the command as a supervised background job. Without job control it stays
+# in the script's foreground process group, so terminal interaction (prompts,
+# terminal-generated Ctrl-C) is preserved, while $! lets the signal traps
+# forward script-directed signals to the active updater.
 phase() {
   local name=$1
   shift
   local started rc
   started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   log "command=$name argv=$* start=$started" || return 74
-  if "$@"; then rc=0; else rc=$?; fi
+  "$@" &
+  CHILD_PID=$!
+  if wait "$CHILD_PID"; then rc=0; else rc=$?; fi
+  CHILD_PID=
   if ! log "command=$name exit=$rc"; then
     ((rc != 0)) && return "$rc"
     return 74
@@ -278,10 +306,11 @@ main() {
   log "mode=$mode log=$LOG_FILE" || fail 'cannot write initial log'
 
   # Cancellation must stop the whole run, not be recorded as one section's
-  # failure while later updaters keep mutating packages.
-  trap 'log "received SIGINT; stopping the run" || true; exit 130' INT
-  trap 'log "received SIGTERM; stopping the run" || true; exit 143' TERM
-  trap 'log "received SIGHUP; stopping the run" || true; exit 129' HUP
+  # failure while later updaters keep mutating packages. Signals are
+  # forwarded to the active command and awaited before the lock is released.
+  trap 'on_signal INT 130' INT
+  trap 'on_signal TERM 143' TERM
+  trap 'on_signal HUP 129' HUP
 
   for id in "${SECTIONS[@]}"; do
     if section_skipped "$id"; then

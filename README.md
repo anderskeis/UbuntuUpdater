@@ -33,8 +33,9 @@ sudo — `sudo` is used per command where needed).
   packages (see `filter-global-npm.js`, which must sit next to the script).
 - A failing section does not stop the others; the exit code is 0 only if all
   active sections succeeded.
-- Ctrl-C / SIGTERM / SIGHUP stops the whole run immediately — no later section
-  is started after cancellation.
+- Ctrl-C / SIGTERM / SIGHUP is forwarded to the active updater; the run stops
+  once that command exits and no later section is started. The maintenance lock
+  is held until then.
 - `/var/run/reboot-required` is reported at the end but a reboot is never
   performed. Note fwupd can stage firmware that needs a reboot without that
   marker existing.
