@@ -21,6 +21,7 @@ SECTIONS=(apt snap flatpak fwupd pipx brew npm)
 SKIP_APT=false SKIP_SNAP=false SKIP_FLATPAK=false SKIP_FWUPD=false SKIP_PIPX=false SKIP_BREW=false SKIP_NPM=false
 NPM_ARGS=()
 CHILD_PID=
+STDIN_FD=0
 
 usage() {
   cat <<'USAGE'
@@ -67,32 +68,35 @@ log() {
 # released after the active updater has shut down.
 on_signal() {
   local sig=$1 code=$2 pid=$CHILD_PID i
-  log "received SIG$sig; forwarding to active command and stopping the run" || true
+  log "received SIG$sig; forwarding to the updater process group and stopping the run" || true
   if [[ -n $pid ]]; then
-    kill -"$sig" "$pid" 2>/dev/null || true
-    # Async children ignore SIGINT/SIGQUIT, so escalate if the command does
-    # not stop promptly; always reap it before exiting so the lock (fd 9) is
-    # released only after the active updater has stopped.
-    for ((i = 0; i < 20; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-    kill -TERM "$pid" 2>/dev/null || true
-    for ((i = 0; i < 20; i++)); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-    kill -KILL "$pid" 2>/dev/null || true
+    # The updater runs under setsid, so signal its whole process group (fall
+    # back to the bare PID). Async children ignore SIGINT/SIGQUIT, so escalate
+    # if the tree does not stop promptly; reap before exiting so the lock
+    # (fd 9) is released only after the updater tree has stopped.
+    kill -"$sig" -"$pid" 2>/dev/null || kill -"$sig" "$pid" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    for ((i = 0; i < 20; i++)); do kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
     wait "$pid" 2>/dev/null || true
   fi
   exit "$code"
 }
 
-# Run the command as a supervised background job. Without job control it stays
-# in the script's foreground process group, so terminal interaction (prompts,
-# terminal-generated Ctrl-C) is preserved, while $! lets the signal traps
-# forward script-directed signals to the active updater.
+# Run the command as a supervised background job. setsid puts the updater in
+# its own process group so cancellation can be signaled to the whole tree;
+# <&"$STDIN_FD" re-attaches the caller's saved stdin, which bash would
+# otherwise point at /dev/null for background jobs, so native prompts
+# (apt's [Y/n], sudo's password) still work.
 phase() {
   local name=$1
   shift
   local started rc
   started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   log "command=$name argv=$* start=$started" || return 74
-  "$@" &
+  setsid "$@" <&"$STDIN_FD" &
   CHILD_PID=$!
   if wait "$CHILD_PID"; then rc=0; else rc=$?; fi
   CHILD_PID=
@@ -276,8 +280,15 @@ main() {
   done
 
   [[ $EUID -ne 0 ]] || fail 'run as the owning non-root user; do not invoke the whole script with sudo'
-  for cmd in uname date mkdir stat flock; do command -v "$cmd" >/dev/null || fail "required command not found: $cmd"; done
+  for cmd in uname date mkdir stat flock setsid; do command -v "$cmd" >/dev/null || fail "required command not found: $cmd"; done
   [[ $(uname -s) == Linux ]] || fail 'Linux is required'
+
+  # Save the caller's stdin; phase() re-attaches this fd for supervised
+  # commands because bash points background jobs' stdin at /dev/null.
+  if (exec 3<&0) 2>/dev/null; then
+    exec 3<&0
+    STDIN_FD=3
+  fi
 
   mkdir -p -- "$STATE_DIR" || fail "cannot create state directory: $STATE_DIR"
   [[ -d $STATE_DIR && ! -L $STATE_DIR ]] || fail "state directory is not a directory: $STATE_DIR"
