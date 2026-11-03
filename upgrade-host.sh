@@ -126,9 +126,9 @@ preview_flatpak() {
 }
 apply_flatpak() {
   local rc=0
-  phase flatpak-update-user flatpak update -y || rc=$?
+  phase flatpak-update-user flatpak update --user -y || rc=$?
   if flatpak_system; then
-    phase flatpak-update-system sudo flatpak update -y || rc=$?
+    phase flatpak-update-system sudo flatpak update --system -y || rc=$?
   fi
   return "$rc"
 }
@@ -321,9 +321,9 @@ main() {
   done
 
   if [[ -e /var/run/reboot-required ]]; then
-    log 'Reboot required: yes (not performed)' || true
+    log 'Reboot required: yes (/var/run/reboot-required present; not performed)' || true
   else
-    log 'Reboot required: no' || true
+    log 'Reboot required: not indicated by /var/run/reboot-required (fwupd may still have staged firmware that needs a reboot; never performed)' || true
   fi
 
   if [[ -n $failed ]]; then

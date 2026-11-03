@@ -19,6 +19,14 @@ function fail(code, msg) {
   process.exit(code);
 }
 
+// A name is safe to forward to `npm update` only if it is relative and every
+// path segment is a real segment — no '', '.', '..' traversal, no absolutes.
+function isSafePackageName(name) {
+  if (typeof name !== 'string' || name.length === 0 || name.includes('\0')) return false;
+  if (path.isAbsolute(name)) return false;
+  return name.split('/').every((seg) => seg !== '' && seg !== '.' && seg !== '..');
+}
+
 function main() {
   const root = process.argv[2];
   if (!root || !path.isAbsolute(root)) {
@@ -52,6 +60,10 @@ function main() {
     if (PROTECTED_PREFIXES.some((p) => name.startsWith(p))) continue;
     if (deps[name] && deps[name].invalid === true) {
       console.error('filter-global-npm: skipping invalid package: ' + name);
+      continue;
+    }
+    if (!isSafePackageName(name)) {
+      console.error('filter-global-npm: skipping unsafe package name: ' + JSON.stringify(name));
       continue;
     }
     const dir = path.join(root, name);

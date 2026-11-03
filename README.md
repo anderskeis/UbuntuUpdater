@@ -33,6 +33,8 @@ sudo — `sudo` is used per command where needed).
   packages (see `filter-global-npm.js`, which must sit next to the script).
 - A failing section does not stop the others; the exit code is 0 only if all
   active sections succeeded.
-- A required reboot is reported at the end but never performed.
+- `/var/run/reboot-required` is reported at the end but a reboot is never
+  performed. Note fwupd can stage firmware that needs a reboot without that
+  marker existing.
 - State, lock, and per-run logs live in `~/.ubuntu-updater`
   (override with the `STATE_DIR` environment variable).
