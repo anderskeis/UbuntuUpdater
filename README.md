@@ -15,6 +15,38 @@ sudo — `sudo` is used per command where needed).
 | brew | `brew update` + `brew upgrade` | `brew` installed |
 | npm | `npm update -g` over eligible global packages | `npm` + `node` installed |
 
+## Install
+
+Download the script and the npm helper from GitHub into a directory on your
+`PATH` (e.g. `~/.local/bin`). Both files must sit in the same directory — the
+script loads `filter-global-npm.js` from its own location:
+
+```bash
+mkdir -p ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/anderskeis/UbuntuUpdater/main/upgrade-host.sh -o ~/.local/bin/upgrade-host.sh
+curl -fsSL https://raw.githubusercontent.com/anderskeis/UbuntuUpdater/main/filter-global-npm.js -o ~/.local/bin/filter-global-npm.js
+chmod +x ~/.local/bin/upgrade-host.sh
+```
+
+Then run it from anywhere:
+
+```bash
+upgrade-host.sh            # preview (dry-run) — default, never mutates
+upgrade-host.sh --apply    # actually update; needs a terminal, asks [y/N]
+```
+
+Alternatively, clone the repo and run the script from the checkout:
+
+```bash
+git clone https://github.com/anderskeis/UbuntuUpdater.git
+cd UbuntuUpdater
+./upgrade-host.sh --help
+```
+
+Any download method works (curl, wget, browser) as long as `upgrade-host.sh` and
+`filter-global-npm.js` end up side by side. Requires Linux and bash; the other
+required commands (`ps`, `awk`, `flock`, ...) are checked at startup.
+
 ## Usage
 
 ```bash
