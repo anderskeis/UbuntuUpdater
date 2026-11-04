@@ -63,15 +63,17 @@ log() {
   fi
 }
 
-# Print the PID of the supervised command plus all of its descendants. Only
-# descendants are listed — never this script or its ancestors — so signaling
-# the returned PIDs can never hit the invoking shell.
+# Print the live PIDs among the supplied roots and their descendants. Only the
+# supervised command's tree is included — never this script or its ancestors.
 tree_pids() {
-  local root=$1
-  ps -eo pid=,ppid= | awk -v root="$root" '
+  local roots="$*"
+  ps -eo pid=,ppid= | awk -v roots="$roots" '
+    BEGIN {
+      count = split(roots, root, " ")
+      for (i = 1; i <= count; i++) want[root[i]] = 1
+    }
     { ppid[$1] = $2 }
     END {
-      want[root] = 1
       do {
         changed = 0
         for (p in ppid)
@@ -81,7 +83,7 @@ tree_pids() {
       # actually marked, otherwise every pid in the ps output is listed and
       # signaling them would hit unrelated processes, including ancestors of
       # this script.
-      for (p in want) if (want[p]) print p
+      for (p in want) if (want[p] && p in ppid) print p
     }'
 }
 
@@ -104,30 +106,57 @@ pids_alive() {
   return 1
 }
 
-# Cancellation handler: forward the signal to the active command's whole tree,
-# wait for it to stop, then exit — so no later section starts and the lock
+# Add newly discovered descendants to the tracked tree and signal them.
+refresh_tree() {
+  local sig=$1 p
+  local -a found=()
+  mapfile -t found < <(tree_pids "${pids[@]}")
+  for p in "${found[@]}"; do
+    if [[ ! ${known_pids[$p]+present} ]]; then
+      known_pids[$p]=1
+      pids+=("$p")
+      signal_pids "$sig" "$p"
+    fi
+  done
+}
+
+# Cancellation handler: keep discovering and signaling descendants until the
+# updater tree stops, then exit — so no later section starts and the lock
 # (fd 9) is only released after the active updater has shut down.
 on_signal() {
-  local sig=$1 code=$2 pid=$CHILD_PID i
-  local pids=()
+  local sig=$1 code=$2 pid=$CHILD_PID i p
+  local -a pids=()
+  local -A known_pids=()
   log "received SIG$sig; forwarding to the updater process tree and stopping the run" || true
   if [[ -n $pid ]]; then
-    # Snapshot the tree once: when the root exits, surviving grandchildren are
-    # reparented and a fresh ppid walk would miss them. The child deliberately
-    # stays in the script's session (no setsid), so the controlling terminal
-    # and /dev/tty remain available and sudo's password prompt works; only the
-    # enumerated descendant PIDs are signaled — never the process group, which
-    # would include this script and its parent shell. Async children ignore
-    # SIGINT/SIGQUIT, so escalate if the tree does not stop promptly; reap
-    # before exiting so the lock (fd 9) is released only after the updater
-    # tree has stopped.
-    mapfile -t pids <<<"$(tree_pids "$pid")"
+    # Keep every discovered PID as a scan root: descendants can be created
+    # while cancellation is underway, and a discovered process remains a scan
+    # root if its parent exits. The child deliberately stays in this script's
+    # session (no setsid), preserving terminal access;
+    # signal only discovered PIDs, never the process group, which would hit
+    # this script and its parent shell.
+    pids=("$pid")
+    known_pids[$pid]=1
+    mapfile -t pids < <(tree_pids "$pid")
+    for p in "${pids[@]}"; do known_pids[$p]=1; done
     signal_pids "$sig" "${pids[@]}"
-    for ((i = 0; i < 20; i++)); do pids_alive "${pids[@]}" || break; sleep 0.1; done
+    for ((i = 0; i < 20; i++)); do
+      refresh_tree "$sig"
+      pids_alive "${pids[@]}" || break
+      sleep 0.1
+    done
     signal_pids TERM "${pids[@]}"
-    for ((i = 0; i < 20; i++)); do pids_alive "${pids[@]}" || break; sleep 0.1; done
+    for ((i = 0; i < 20; i++)); do
+      refresh_tree TERM
+      pids_alive "${pids[@]}" || break
+      sleep 0.1
+    done
     signal_pids KILL "${pids[@]}"
-    for ((i = 0; i < 20; i++)); do pids_alive "${pids[@]}" || break; sleep 0.1; done
+    for ((i = 0; i < 20; i++)); do
+      refresh_tree KILL
+      pids_alive "${pids[@]}" || break
+      sleep 0.1
+    done
     wait "$pid" 2>/dev/null || true
   fi
   exit "$code"
