@@ -63,40 +63,89 @@ log() {
   fi
 }
 
-# Cancellation handler: forward the signal to the active command, wait for it
-# to stop, then exit — so no later section starts and the lock (fd 9) is only
-# released after the active updater has shut down.
+# Print the PID of the supervised command plus all of its descendants. Only
+# descendants are listed — never this script or its ancestors — so signaling
+# the returned PIDs can never hit the invoking shell.
+tree_pids() {
+  local root=$1
+  ps -eo pid=,ppid= | awk -v root="$root" '
+    { ppid[$1] = $2 }
+    END {
+      want[root] = 1
+      do {
+        changed = 0
+        for (p in ppid)
+          if (want[ppid[p]] && !(p in want)) { want[p] = 1; changed = 1 }
+      } while (changed)
+      # Referencing want[...] above creates empty entries; print only members
+      # actually marked, otherwise every pid in the ps output is listed and
+      # signaling them would hit unrelated processes, including ancestors of
+      # this script.
+      for (p in want) if (want[p]) print p
+    }'
+}
+
+# Signal exactly the listed PIDs — never a process group: the supervised child
+# stays in this script's own process group, so a group kill would hit this
+# script and the invoking shell.
+signal_pids() {
+  local sig=$1 p
+  shift
+  for p in "$@"; do
+    kill -"$sig" "$p" 2>/dev/null || true
+  done
+}
+
+pids_alive() {
+  local p
+  for p in "$@"; do
+    if kill -0 "$p" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+
+# Cancellation handler: forward the signal to the active command's whole tree,
+# wait for it to stop, then exit — so no later section starts and the lock
+# (fd 9) is only released after the active updater has shut down.
 on_signal() {
   local sig=$1 code=$2 pid=$CHILD_PID i
-  log "received SIG$sig; forwarding to the updater process group and stopping the run" || true
+  local pids=()
+  log "received SIG$sig; forwarding to the updater process tree and stopping the run" || true
   if [[ -n $pid ]]; then
-    # The updater runs under setsid, so signal its whole process group (fall
-    # back to the bare PID). Async children ignore SIGINT/SIGQUIT, so escalate
-    # if the tree does not stop promptly; reap before exiting so the lock
-    # (fd 9) is released only after the updater tree has stopped.
-    kill -"$sig" -"$pid" 2>/dev/null || kill -"$sig" "$pid" 2>/dev/null || true
-    for ((i = 0; i < 20; i++)); do kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-    kill -TERM -"$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
-    for ((i = 0; i < 20; i++)); do kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
-    kill -KILL -"$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
-    for ((i = 0; i < 20; i++)); do kill -0 -"$pid" 2>/dev/null || kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+    # Snapshot the tree once: when the root exits, surviving grandchildren are
+    # reparented and a fresh ppid walk would miss them. The child deliberately
+    # stays in the script's session (no setsid), so the controlling terminal
+    # and /dev/tty remain available and sudo's password prompt works; only the
+    # enumerated descendant PIDs are signaled — never the process group, which
+    # would include this script and its parent shell. Async children ignore
+    # SIGINT/SIGQUIT, so escalate if the tree does not stop promptly; reap
+    # before exiting so the lock (fd 9) is released only after the updater
+    # tree has stopped.
+    mapfile -t pids <<<"$(tree_pids "$pid")"
+    signal_pids "$sig" "${pids[@]}"
+    for ((i = 0; i < 20; i++)); do pids_alive "${pids[@]}" || break; sleep 0.1; done
+    signal_pids TERM "${pids[@]}"
+    for ((i = 0; i < 20; i++)); do pids_alive "${pids[@]}" || break; sleep 0.1; done
+    signal_pids KILL "${pids[@]}"
+    for ((i = 0; i < 20; i++)); do pids_alive "${pids[@]}" || break; sleep 0.1; done
     wait "$pid" 2>/dev/null || true
   fi
   exit "$code"
 }
 
-# Run the command as a supervised background job. setsid puts the updater in
-# its own process group so cancellation can be signaled to the whole tree;
-# <&"$STDIN_FD" re-attaches the caller's saved stdin, which bash would
-# otherwise point at /dev/null for background jobs, so native prompts
-# (apt's [Y/n], sudo's password) still work.
+# Run the command as a supervised background job. The child stays in the
+# script's process group and session, so the controlling terminal and /dev/tty
+# remain available (sudo's password prompt works); <&"$STDIN_FD" re-attaches
+# the caller's saved stdin, which bash would otherwise point at /dev/null for
+# background jobs, so native prompts (apt's [Y/n]) still work. $! lets the
+# signal traps forward cancellation to the whole updater tree.
 phase() {
   local name=$1
   shift
   local started rc
   started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   log "command=$name argv=$* start=$started" || return 74
-  setsid "$@" <&"$STDIN_FD" &
+  "$@" <&"$STDIN_FD" &
   CHILD_PID=$!
   if wait "$CHILD_PID"; then rc=0; else rc=$?; fi
   CHILD_PID=
@@ -280,7 +329,7 @@ main() {
   done
 
   [[ $EUID -ne 0 ]] || fail 'run as the owning non-root user; do not invoke the whole script with sudo'
-  for cmd in uname date mkdir stat flock setsid; do command -v "$cmd" >/dev/null || fail "required command not found: $cmd"; done
+  for cmd in uname date mkdir stat flock ps awk; do command -v "$cmd" >/dev/null || fail "required command not found: $cmd"; done
   [[ $(uname -s) == Linux ]] || fail 'Linux is required'
 
   # Save the caller's stdin; phase() re-attaches this fd for supervised

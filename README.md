@@ -34,9 +34,10 @@ sudo — `sudo` is used per command where needed).
 - A failing section does not stop the others; the exit code is 0 only if all
   active sections succeeded.
 - Ctrl-C / SIGTERM / SIGHUP is forwarded to the active updater's whole process
-  group; the run stops once that tree has exited and no later section is
+  tree; the run stops once that tree has exited and no later section is
   started. The maintenance lock is held until then. Native prompts (apt's
-  `[Y/n]`, sudo's password) keep working — the caller's stdin is preserved.
+  `[Y/n]`, sudo's password via `/dev/tty`) keep working — the caller's stdin
+  and controlling terminal are preserved.
 - `/var/run/reboot-required` is reported at the end but a reboot is never
   performed. Note fwupd can stage firmware that needs a reboot without that
   marker existing.
