@@ -1,213 +1,463 @@
 #!/usr/bin/env bash
+# upgrade-host.sh — universal updater for Ubuntu hosts.
+#
+# Detects which native updaters are present on the system and runs only those,
+# always through each tool's own native update command:
+#   apt, snap, flatpak, fwupd, pipx, Homebrew (if installed), global npm.
+#
+# Safe by default: with no flags it runs a preview (dry-run) using cached
+# metadata where the tool supports it. --apply performs the real updates and
+# requires an interactive terminal plus an explicit confirmation.
 set -Eeuo pipefail
 umask 077
 
-STATE_DIR=${STATE_DIR:-"${HOME}/.openclaw-host-maintenance"}
+STATE_DIR=${STATE_DIR:-"${HOME}/.ubuntu-updater"}
 APPLY=false
-APPLY_SET=false
 DRY_RUN_SET=false
-SKIP_APT=false
-SKIP_BREW=false
-SKIP_NPM=false
 LOG_FILE=
 SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
+SECTIONS=(apt snap flatpak fwupd pipx brew npm)
+SKIP_APT=false SKIP_SNAP=false SKIP_FLATPAK=false SKIP_FWUPD=false SKIP_PIPX=false SKIP_BREW=false SKIP_NPM=false
+NPM_ARGS=()
+CHILD_PID=
+STDIN_FD=0
+
 usage() {
   cat <<'USAGE'
-Interactive host package maintenance (safe cached preview is the default)
-Usage: upgrade-host.sh [--dry-run] [--apply] [--skip-apt] [--skip-brew] [--skip-npm]
-Preview uses cached APT/Brew metadata and a registry-aware native npm dry-run.
-Apply refreshes and upgrades selected APT, Homebrew, then eligible global npm
-packages. OpenClaw, npm, Node, Corepack, and @openclaw/* are never selected.
-Run as the normal owner, never as whole-script sudo. Native output, prompts,
-trust decisions, and interrupts remain visible.
+Universal Ubuntu host updater — preview (dry-run) is the default.
+Usage: upgrade-host.sh [--dry-run] [--apply] [--skip-<section>...]
+
+Sections (auto-detected; skipped when not installed on this host):
+  apt      APT packages       -> apt-get update + upgrade (sudo per command)
+  snap     snaps               -> sudo snap refresh
+  flatpak  flatpak apps        -> flatpak update
+  fwupd    device firmware     -> fwupdmgr update
+  pipx     pipx apps           -> pipx upgrade-all
+  brew     Homebrew packages   -> brew update + brew upgrade (if brew installed)
+  npm      global npm packages -> npm update -g (npm/node/corepack/OpenClaw excluded)
+
+Options:
+  --dry-run       Show what would change using cached metadata (default)
+  --apply         Actually refresh and upgrade; needs a terminal and [y] confirm
+  --skip-apt --skip-snap --skip-flatpak --skip-fwupd --skip-pipx --skip-brew --skip-npm
+  -h, --help      This help
+
+State and logs live in ${STATE_DIR:-$HOME/.ubuntu-updater} (override with the
+STATE_DIR environment variable). Run as the normal owning user, never as root
+or via whole-script sudo. Preview never mutates the system; native output,
+prompts, and interrupts remain visible.
 USAGE
 }
+
 fail() {
   printf 'ERROR: %s\n' "$*" >&2
   exit 1
 }
-owner_check() { [[ ${1:?missing uid} -ne 0 ]]; }
+
 log() {
   local line=$*
   printf '%s\n' "$line" || return
-  printf '%s\n' "$line" >>"$LOG_FILE" || return
+  if [[ -n $LOG_FILE ]]; then
+    printf '%s\n' "$line" >>"$LOG_FILE"
+  fi
 }
+
+# Print the live PIDs among the supplied roots and their descendants. Only the
+# supervised command's tree is included — never this script or its ancestors.
+tree_pids() {
+  local roots="$*"
+  ps -eo pid=,ppid= | awk -v roots="$roots" '
+    BEGIN {
+      count = split(roots, root, " ")
+      for (i = 1; i <= count; i++) want[root[i]] = 1
+    }
+    { ppid[$1] = $2 }
+    END {
+      do {
+        changed = 0
+        for (p in ppid)
+          if (want[ppid[p]] && !(p in want)) { want[p] = 1; changed = 1 }
+      } while (changed)
+      # Referencing want[...] above creates empty entries; print only members
+      # actually marked, otherwise every pid in the ps output is listed and
+      # signaling them would hit unrelated processes, including ancestors of
+      # this script.
+      for (p in want) if (want[p] && p in ppid) print p
+    }'
+}
+
+# Signal exactly the listed PIDs — never a process group: the supervised child
+# stays in this script's own process group, so a group kill would hit this
+# script and the invoking shell.
+signal_pids() {
+  local sig=$1 p
+  shift
+  for p in "$@"; do
+    kill -"$sig" "$p" 2>/dev/null || true
+  done
+}
+
+pids_alive() {
+  local p
+  for p in "$@"; do
+    if kill -0 "$p" 2>/dev/null; then return 0; fi
+  done
+  return 1
+}
+
+# Add newly discovered descendants to the tracked tree and signal them.
+refresh_tree() {
+  local sig=$1 p
+  local -a found=()
+  mapfile -t found < <(tree_pids "${pids[@]}")
+  for p in "${found[@]}"; do
+    if [[ ! ${known_pids[$p]+present} ]]; then
+      known_pids[$p]=1
+      pids+=("$p")
+      signal_pids "$sig" "$p"
+    fi
+  done
+}
+
+# Cancellation handler: keep discovering and signaling descendants until the
+# updater tree stops, then exit — so no later section starts and the lock
+# (fd 9) is only released after the active updater has shut down.
+on_signal() {
+  local sig=$1 code=$2 pid=$CHILD_PID i p
+  local -a pids=()
+  local -A known_pids=()
+  log "received SIG$sig; forwarding to the updater process tree and stopping the run" || true
+  if [[ -n $pid ]]; then
+    # Keep every discovered PID as a scan root: descendants can be created
+    # while cancellation is underway, and a discovered process remains a scan
+    # root if its parent exits. The child deliberately stays in this script's
+    # session (no setsid), preserving terminal access;
+    # signal only discovered PIDs, never the process group, which would hit
+    # this script and its parent shell.
+    pids=("$pid")
+    known_pids[$pid]=1
+    mapfile -t pids < <(tree_pids "$pid")
+    for p in "${pids[@]}"; do known_pids[$p]=1; done
+    signal_pids "$sig" "${pids[@]}"
+    for ((i = 0; i < 20; i++)); do
+      refresh_tree "$sig"
+      pids_alive "${pids[@]}" || break
+      sleep 0.1
+    done
+    signal_pids TERM "${pids[@]}"
+    for ((i = 0; i < 20; i++)); do
+      refresh_tree TERM
+      pids_alive "${pids[@]}" || break
+      sleep 0.1
+    done
+    signal_pids KILL "${pids[@]}"
+    for ((i = 0; i < 20; i++)); do
+      refresh_tree KILL
+      pids_alive "${pids[@]}" || break
+      sleep 0.1
+    done
+    wait "$pid" 2>/dev/null || true
+  fi
+  exit "$code"
+}
+
+# Run the command as a supervised background job. The child stays in the
+# script's process group and session, so the controlling terminal and /dev/tty
+# remain available (sudo's password prompt works); <&"$STDIN_FD" re-attaches
+# the caller's saved stdin, which bash would otherwise point at /dev/null for
+# background jobs, so native prompts (apt's [Y/n]) still work. $! lets the
+# signal traps forward cancellation to the whole updater tree.
 phase() {
   local name=$1
   shift
   local started rc
   started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  if ! log "command=$name argv=$* start=$started"; then
-    printf 'ERROR: cannot write phase start log; no command started\n' >&2
-    return 74
-  fi
-  if "$@"; then rc=0; else rc=$?; fi
+  log "command=$name argv=$* start=$started" || return 74
+  "$@" <&"$STDIN_FD" &
+  CHILD_PID=$!
+  if wait "$CHILD_PID"; then rc=0; else rc=$?; fi
+  CHILD_PID=
   if ! log "command=$name exit=$rc"; then
-    printf 'ERROR: cannot write phase exit log\n' >&2
     ((rc != 0)) && return "$rc"
     return 74
   fi
   return "$rc"
 }
-require_npm() {
-  command -v npm >/dev/null || fail 'required command not found: npm'
-  command -v node >/dev/null || fail 'required command not found: node'
+
+section_skipped() {
+  case $1 in
+    apt) [[ $SKIP_APT == true ]] ;;
+    snap) [[ $SKIP_SNAP == true ]] ;;
+    flatpak) [[ $SKIP_FLATPAK == true ]] ;;
+    fwupd) [[ $SKIP_FWUPD == true ]] ;;
+    pipx) [[ $SKIP_PIPX == true ]] ;;
+    brew) [[ $SKIP_BREW == true ]] ;;
+    npm) [[ $SKIP_NPM == true ]] ;;
+  esac
 }
-discover_npm() {
-  local npm_bin=$1 node_bin=$2 root inventory_json helper rc
-  if root=$("$npm_bin" root --global); then :; else
-    rc=$?
-    return "$rc"
+
+section_available() {
+  case $1 in
+    apt) command -v apt-get >/dev/null 2>&1 ;;
+    snap) command -v snap >/dev/null 2>&1 ;;
+    flatpak) command -v flatpak >/dev/null 2>&1 ;;
+    fwupd) command -v fwupdmgr >/dev/null 2>&1 ;;
+    pipx) command -v pipx >/dev/null 2>&1 ;;
+    brew) command -v brew >/dev/null 2>&1 ;;
+    npm) command -v npm >/dev/null 2>&1 && command -v node >/dev/null 2>&1 ;;
+  esac
+}
+
+flatpak_system() { [[ -d /var/lib/flatpak ]]; }
+
+preview_apt() { phase apt-preview apt-get -s --no-remove upgrade; }
+apply_apt() {
+  phase apt-refresh sudo apt-get --error-on=any update || return $?
+  phase apt-upgrade sudo apt-get --no-remove upgrade || return $?
+  phase apt-remaining apt-get -s --no-remove upgrade || return $?
+}
+
+preview_snap() {
+  if snap refresh --help 2>&1 | grep -q -- '--list'; then
+    phase snap-preview snap refresh --list || return $?
+  else
+    log 'snap refresh --list not supported here; falling back to snap list' || return 74
+    phase snap-list snap list || return $?
   fi
+}
+apply_snap() { phase snap-refresh sudo snap refresh; }
+
+preview_flatpak() {
+  if flatpak remote-ls --help 2>&1 | grep -q -- '--updates'; then
+    phase flatpak-preview flatpak remote-ls --updates || return $?
+  else
+    log 'flatpak remote-ls --updates not supported here; listing installed flatpaks' || return 74
+    phase flatpak-list flatpak list --columns=application,version || return $?
+  fi
+}
+apply_flatpak() {
+  local rc=0
+  phase flatpak-update-user flatpak update --user -y || rc=$?
+  if flatpak_system; then
+    phase flatpak-update-system sudo flatpak update --system -y || rc=$?
+  fi
+  return "$rc"
+}
+
+# fwupdmgr uses exit status 2 for "nothing to do"; treat it as success.
+fwupd_run() {
+  local name=$1 rc=0
+  shift
+  phase "$name" "$@" || rc=$?
+  if ((rc == 2)); then
+    log "command=$name exit=2 (nothing to do); treated as success" || true
+    return 0
+  fi
+  return "$rc"
+}
+preview_fwupd() { fwupd_run fwupd-preview fwupdmgr get-updates; }
+apply_fwupd() {
+  fwupd_run fwupd-refresh fwupdmgr refresh || return $?
+  fwupd_run fwupd-update fwupdmgr update --no-reboot-check || return $?
+}
+
+preview_pipx() {
+  if ! phase pipx-preview pipx list --short; then
+    phase pipx-list pipx list || return $?
+  fi
+}
+apply_pipx() { phase pipx-upgrade pipx upgrade-all; }
+
+preview_brew() { phase brew-preview env HOMEBREW_NO_AUTO_UPDATE=1 brew outdated; }
+apply_brew() {
+  phase brew-update brew update || return $?
+  phase brew-upgrade brew upgrade || return $?
+}
+
+npm_discover() {
+  local npm_bin node_bin root inventory_json helper pkgs rc
+  npm_bin=$(command -v npm) || return $?
+  node_bin=$(command -v node) || return $?
+  root=$("$npm_bin" root --global) || return $?
   [[ -n $root && -d $root && ! -L $root ]] || {
     printf 'ERROR: unsafe npm global root: %s\n' "$root" >&2
     return 65
   }
   helper="$SCRIPT_DIR/filter-global-npm.js"
   [[ -f $helper && ! -L $helper ]] || {
-    printf 'ERROR: npm filter helper unavailable\n' >&2
+    printf 'ERROR: npm filter helper unavailable: %s\n' "$helper" >&2
     return 66
   }
-  if inventory_json=$("$npm_bin" ls --global --depth=0 --json); then :; else
-    rc=$?
-    return "$rc"
-  fi
-  if npm_packages=$(printf '%s' "$inventory_json" | "$node_bin" "$helper" "$root"); then :; else
-    rc=$?
-    printf 'ERROR: invalid npm global inventory\n' >&2
+  inventory_json=$("$npm_bin" ls --global --depth=0 --json) || return $?
+  rc=0
+  pkgs=$(printf '%s' "$inventory_json" | "$node_bin" "$helper" "$root") || rc=$?
+  if ((rc != 0)); then
+    printf 'ERROR: invalid npm global inventory (status %s)\n' "$rc" >&2
     return "$rc"
   fi
   NPM_ARGS=()
-  if [[ -n $npm_packages ]]; then mapfile -t NPM_ARGS <<<"$npm_packages"; fi
-  NPM_BIN=$npm_bin
+  if [[ -n $pkgs ]]; then mapfile -t NPM_ARGS <<<"$pkgs"; fi
 }
-run_npm() { "$NPM_BIN" "$@"; }
+
+preview_npm() {
+  npm_discover || return $?
+  log "npm discovery complete eligible=${#NPM_ARGS[@]}" || return 74
+  if ((${#NPM_ARGS[@]} > 0)); then
+    phase npm-preview npm update --global --dry-run -- "${NPM_ARGS[@]}" || return $?
+  else
+    log 'npm preview skipped: no eligible global packages' || return 74
+  fi
+}
+
+apply_npm() {
+  npm_discover || return $?
+  log "npm rediscovery complete eligible=${#NPM_ARGS[@]}" || return 74
+  if ((${#NPM_ARGS[@]} > 0)); then
+    phase npm-update npm update --global -- "${NPM_ARGS[@]}" || return $?
+    phase npm-remaining npm ls --global --depth=0 -- "${NPM_ARGS[@]}" || return $?
+  else
+    log 'npm skipped: no eligible global packages' || return 74
+  fi
+}
+
+run_section() {
+  local mode=$1 id=$2 rc=0
+  local fn="${mode}_${id}"
+  "$fn" || rc=$?
+  return "$rc"
+}
 
 main() {
+  local answer state_owner state_mode lock_file id mode rc
+  local active=() failed=''
   while (($#)); do
     case $1 in
-    --help | -h)
-      usage
-      exit 0
-      ;;
-    --dry-run)
-      $APPLY_SET && fail '--dry-run and --apply cannot be combined'
-      DRY_RUN_SET=true
-      ;;
-    --apply)
-      $DRY_RUN_SET && fail '--dry-run and --apply cannot be combined'
-      APPLY=true
-      APPLY_SET=true
-      ;;
-    --skip-apt) SKIP_APT=true ;; --skip-brew) SKIP_BREW=true ;; --skip-npm) SKIP_NPM=true ;;
-    --ack-coordination | --runtime-upgrade | --refresh-index | --unattended | --dist-upgrade | --allow-removals | --autoremove) fail "$1 is retired; use --apply/--dry-run and skip flags only" ;;
-    *) fail "unknown option: $1 (see --help)" ;; esac
+      --help | -h)
+        usage
+        exit 0
+        ;;
+      --dry-run)
+        if $APPLY; then fail '--dry-run and --apply cannot be combined'; fi
+        DRY_RUN_SET=true
+        ;;
+      --apply)
+        if $DRY_RUN_SET; then fail '--dry-run and --apply cannot be combined'; fi
+        APPLY=true
+        ;;
+      --skip-apt) SKIP_APT=true ;;
+      --skip-snap) SKIP_SNAP=true ;;
+      --skip-flatpak) SKIP_FLATPAK=true ;;
+      --skip-fwupd) SKIP_FWUPD=true ;;
+      --skip-pipx) SKIP_PIPX=true ;;
+      --skip-brew) SKIP_BREW=true ;;
+      --skip-npm) SKIP_NPM=true ;;
+      *) fail "unknown option: $1 (see --help)" ;;
+    esac
     shift
   done
-  owner_check "$EUID" || fail 'run as the owning non-root user; do not invoke the whole script with sudo'
-  if $APPLY && ! ($SKIP_APT && $SKIP_BREW && $SKIP_NPM) && [[ ! -t 0 || ! -t 1 ]]; then fail '--apply requires an interactive terminal (or skip all sections for a no-op)'; fi
-  for cmd in uname date mkdir stat flock; do command -v "$cmd" >/dev/null || fail "required command not found: $cmd"; done
+
+  [[ $EUID -ne 0 ]] || fail 'run as the owning non-root user; do not invoke the whole script with sudo'
+  for cmd in uname date mkdir stat flock ps awk; do command -v "$cmd" >/dev/null || fail "required command not found: $cmd"; done
   [[ $(uname -s) == Linux ]] || fail 'Linux is required'
-  mkdir -p -- "$STATE_DIR"
+
+  # Save the caller's stdin; phase() re-attaches this fd for supervised
+  # commands because bash points background jobs' stdin at /dev/null.
+  if (exec 3<&0) 2>/dev/null; then
+    exec 3<&0
+    STDIN_FD=3
+  fi
+
+  mkdir -p -- "$STATE_DIR" || fail "cannot create state directory: $STATE_DIR"
   [[ -d $STATE_DIR && ! -L $STATE_DIR ]] || fail "state directory is not a directory: $STATE_DIR"
   state_owner=$(stat -c '%u' -- "$STATE_DIR")
   state_mode=$(stat -c '%a' -- "$STATE_DIR")
   [[ $state_owner -eq $EUID && $((8#$state_mode & 077)) -eq 0 ]] || fail "state directory must be owner-only and owned by uid $EUID: $STATE_DIR"
-  LOCK_FILE=$STATE_DIR/host-maintenance.lock
-  [[ ! -L $LOCK_FILE ]] || fail "unsafe lock symlink: $LOCK_FILE"
-  if [[ -e $LOCK_FILE ]]; then
-    [[ -f $LOCK_FILE ]] || fail "lock is not a regular file: $LOCK_FILE"
-    [[ $(stat -c '%u %h %a' -- "$LOCK_FILE") == "$EUID 1 600" ]] || fail "lock must be a private single-link file owned by uid $EUID: $LOCK_FILE"
+
+  lock_file="$STATE_DIR/host-updater.lock"
+  [[ ! -L $lock_file ]] || fail "unsafe lock symlink: $lock_file"
+  if [[ -e $lock_file ]]; then
+    [[ -f $lock_file ]] || fail "lock is not a regular file: $lock_file"
+    [[ $(stat -c '%u %h %a' -- "$lock_file") == "$EUID 1 600" ]] || fail "lock must be a private single-link file owned by uid $EUID: $lock_file"
   fi
-  exec 9>>"$LOCK_FILE" || fail "cannot open maintenance lock: $LOCK_FILE"
-  flock -n 9 || fail "another host maintenance run owns the lock: $LOCK_FILE"
+  exec 9>>"$lock_file" || fail "cannot open updater lock: $lock_file"
+  flock -n 9 || fail "another updater run owns the lock: $lock_file"
+
   LOG_FILE="$STATE_DIR/$(date -u +%Y%m%dT%H%M%SZ)-$$.log"
   [[ ! -e $LOG_FILE && ! -L $LOG_FILE ]] || fail "log path already exists or is a symlink: $LOG_FILE"
   (
     set -o noclobber
     : >"$LOG_FILE"
   ) || fail "cannot create private log: $LOG_FILE"
-  log "mode=$([[ $APPLY == true ]] && printf apply || printf preview) log=$LOG_FILE" || fail 'cannot write initial log'
-  if $SKIP_APT; then log 'APT skipped (--skip-apt)' || fail 'cannot write skip log'; fi
-  if $SKIP_BREW; then log 'Homebrew skipped (--skip-brew)' || fail 'cannot write skip log'; fi
-  if $SKIP_NPM; then log 'npm skipped (--skip-npm)' || fail 'cannot write skip log'; fi
-  if ! $SKIP_APT; then command -v apt-get >/dev/null || fail 'required command not found: apt-get'; fi
-  BREW=
-  if ! $SKIP_BREW && command -v brew >/dev/null; then BREW=$(command -v brew); elif ! $SKIP_BREW; then
-    log 'Homebrew unavailable; Brew section skipped' || fail 'cannot write log'
-    SKIP_BREW=true
-  fi
-  NPM_BIN=
-  NPM_NODE=
-  NPM_ARGS=()
-  NPM_INITIAL_PRESENT=false
-  if ! $SKIP_NPM; then
-    if command -v npm >/dev/null; then
-      require_npm
-      NPM_INITIAL_PRESENT=true
-      NPM_BIN=$(command -v npm)
-      NPM_NODE=$(command -v node)
-      if discover_npm "$NPM_BIN" "$NPM_NODE"; then :; else
-        rc=$?
-        printf 'ERROR: cannot discover globally installed npm packages (status %s)\n' "$rc" >&2
-        exit "$rc"
-      fi
-      log "npm discovery complete eligible=${#NPM_ARGS[@]}" || fail 'cannot write discovery log'
+
+  mode=preview
+  if $APPLY; then mode=apply; fi
+  log "mode=$mode log=$LOG_FILE" || fail 'cannot write initial log'
+
+  # Cancellation must stop the whole run, not be recorded as one section's
+  # failure while later updaters keep mutating packages. Signals are
+  # forwarded to the active command and awaited before the lock is released.
+  trap 'on_signal INT 130' INT
+  trap 'on_signal TERM 143' TERM
+  trap 'on_signal HUP 129' HUP
+
+  for id in "${SECTIONS[@]}"; do
+    if section_skipped "$id"; then
+      log "section $id skipped (--skip-$id)" || fail 'cannot write skip log'
+    elif section_available "$id"; then
+      active+=("$id")
     else
-      log 'npm unavailable; global npm section skipped' || fail 'cannot write log'
-      SKIP_NPM=true
+      log "section $id unavailable on this host; skipped" || fail 'cannot write skip log'
     fi
-  fi
-  apt_cmd() { sudo apt-get "$@"; }
-  brew_cmd() { "$BREW" "$@"; }
-  if ! $APPLY; then
-    if ! $SKIP_APT; then phase apt-preview apt-get -s --no-remove upgrade || exit $?; fi
-    if [[ -n $BREW ]]; then HOMEBREW_NO_AUTO_UPDATE=1 phase brew-preview brew_cmd outdated || exit $?; fi
-    if ! $SKIP_NPM && ((${#NPM_ARGS[@]})); then phase npm-preview run_npm update --global --dry-run -- "${NPM_ARGS[@]}" || exit $?; elif ! $SKIP_NPM; then log 'npm skipped: no eligible global packages' || fail 'cannot write completion log'; fi
-    log 'Preview complete: APT/Brew metadata was not refreshed; npm preview may use registry/cache and is not an exact upgrade count.' || fail 'cannot write completion log'
+  done
+  log "active sections: ${active[*]:-none}" || fail 'cannot write log'
+
+  if ((${#active[@]} == 0)); then
+    log 'no sections active; nothing to do' || fail 'cannot write log'
     exit 0
   fi
-  if $SKIP_APT && $SKIP_BREW && $SKIP_NPM; then
-    log 'Nothing selected; no mutation performed.' || fail 'cannot write completion log'
-    exit 0
+
+  if $APPLY; then
+    if [[ ! -t 0 || ! -t 1 ]]; then
+      fail '--apply requires an interactive terminal'
+    fi
+    local need_sudo=false
+    for id in "${active[@]}"; do
+      case $id in
+        apt) need_sudo=true ;;
+        snap) need_sudo=true ;;
+        flatpak) if flatpak_system; then need_sudo=true; fi ;;
+      esac
+    done
+    if $need_sudo; then
+      command -v sudo >/dev/null || fail 'required command not found: sudo (needed by active sections)'
+    fi
+    printf "WARNING: --apply refreshes and upgrades via each selected tool's native updater; output and prompts stay visible. Proceed? [y/N] " >&2
+    read -r answer || fail 'apply confirmation could not be read from the terminal'
+    [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || fail 'apply cancelled'
   fi
-  ! $SKIP_APT && { command -v sudo >/dev/null || fail 'required command not found: sudo for apply APT phases'; }
-  printf 'WARNING: apply refreshes and upgrades selected package managers; npm may contact its registry. Homebrew may update Node; global npm updates can change package majors. Do not run an OpenClaw native update concurrently. Proceed? [y/N] ' >&2
-  read -r answer || fail 'apply confirmation could not be read from the terminal'
-  [[ $answer == y || $answer == Y || $answer == yes || $answer == YES ]] || fail 'apply cancelled'
-  if ! $SKIP_APT; then
-    phase apt-refresh apt_cmd --error-on=any update || exit $?
-    phase apt-upgrade apt_cmd --no-remove upgrade || exit $?
-    phase apt-remaining apt_cmd -s --no-remove upgrade || exit $?
+
+  for id in "${active[@]}"; do
+    if run_section "$mode" "$id"; then
+      log "section $id ok" || true
+    else
+      rc=$?
+      log "section $id FAILED (exit $rc)" || true
+      failed="$failed $id"
+    fi
+  done
+
+  if [[ -e /var/run/reboot-required ]]; then
+    log 'Reboot required: yes (/var/run/reboot-required present; not performed)' || true
+  else
+    log 'Reboot required: not indicated by /var/run/reboot-required (fwupd may still have staged firmware that needs a reboot; never performed)' || true
   fi
-  if [[ -n $BREW ]]; then
-    phase brew-refresh brew_cmd update || exit $?
-    phase brew-upgrade brew_cmd upgrade || exit $?
-    HOMEBREW_NO_AUTO_UPDATE=1 phase brew-remaining brew_cmd outdated || exit $?
+
+  if [[ -n $failed ]]; then
+    log "Completed with failures:$failed" || true
+    exit 1
   fi
-  log 'remaining inventories:' || fail 'cannot write inventory heading'
-  if ! $SKIP_NPM; then
-    if command -v npm >/dev/null && command -v node >/dev/null; then
-      NPM_BIN=$(command -v npm)
-      NPM_NODE=$(command -v node)
-      if discover_npm "$NPM_BIN" "$NPM_NODE"; then :; else
-        rc=$?
-        printf 'ERROR: cannot rediscover globally installed npm packages after Brew (status %s)\n' "$rc" >&2
-        exit "$rc"
-      fi
-      log "npm rediscovery complete eligible=${#NPM_ARGS[@]}" || fail 'cannot write discovery log'
-      if ((${#NPM_ARGS[@]})); then
-        phase npm-update run_npm update --global -- "${NPM_ARGS[@]}" || exit $?
-        phase npm-remaining run_npm ls --global --depth=0 -- "${NPM_ARGS[@]}" || exit $?
-      else log 'npm skipped: no eligible global packages'; fi
-    elif $NPM_INITIAL_PRESENT; then
-      log 'npm or node disappeared after Brew; global npm maintenance failed closed' || fail 'npm or node disappeared after Brew'
-      exit 127
-    else log 'npm remained an explicit initial optional skip' || fail 'cannot write log'; fi
-  fi
-  if [[ -e /var/run/reboot-required ]]; then log 'Reboot required: yes (not performed)' || fail 'cannot write completion log'; else log 'Reboot required: no' || fail 'cannot write completion log'; fi
-  log 'Apply complete; zero exit is not a claim that every package is current.' || fail 'cannot write completion log'
-  log "Phase log (metadata only): $LOG_FILE" || fail 'cannot write completion log'
+  log 'All selected sections completed' || true
 }
+
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi
